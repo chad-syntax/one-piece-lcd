@@ -3,12 +3,16 @@
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import TYPE_CHECKING, Optional, List, Dict, Any
 from urllib.parse import urlparse
 
 import aiofiles
 import aiohttp
+
+if TYPE_CHECKING:
+    from .faces import AnimeFaceProcessor
 
 from ..constants.config import MAX_CONCURRENT_PROCESSING
 from ..constants.paths import (
@@ -259,11 +263,21 @@ async def process_all_characters(force_refresh: bool = False):
 
 
 def _process_single_character(
-    args: tuple
-) -> Optional[tuple[str, List[str], int]]:
-    """Process faces for a single character. Used by ThreadPoolExecutor."""
-    char_dir, force_refresh, processor, idx, total_chars = args
+    char_dir: Path,
+    force_refresh: bool,
+    processor: "AnimeFaceProcessor",  # Forward reference
+    idx: int,
+    total_chars: int
+) -> Optional[Dict[str, Any]]:
+    """Process faces and generate embeddings for a single character.
     
+    Generates embeddings for:
+    - Full character images (image_1.png -> image_1.npy)
+    - Cropped face images (image_1_face_1.png -> image_1_face_1.npy)
+    
+    Returns:
+        Dict with character data including all paths, or None if failed
+    """
     character_id = char_dir.name
     character_json_path = char_dir / CHARACTER_JSON_FILENAME
     
@@ -278,7 +292,9 @@ def _process_single_character(
     
     # Get image paths
     image_paths = char_data.get("image_paths", [])
-    face_image_paths = []
+    face_image_paths: List[str] = []
+    face_embedding_paths: List[str] = []
+    image_embedding_paths: List[str] = []
     char_faces_detected = 0
     
     for img_path in image_paths:
@@ -287,7 +303,13 @@ def _process_single_character(
         if not abs_path.exists():
             continue
         
-        # Check if face images already exist
+        # Generate embedding for full character image
+        embedding = processor.get_or_create_embedding(abs_path, force_refresh=force_refresh)
+        if embedding is not None:
+            npy_path = abs_path.with_suffix(".npy")
+            image_embedding_paths.append(f"./{npy_path}")
+        
+        # Check if face images already exist (from previous runs)
         existing_faces = list(abs_path.parent.glob(f"{abs_path.stem}_face_*.png"))
         
         if existing_faces and not force_refresh:
@@ -297,8 +319,11 @@ def _process_single_character(
                 face_image_paths.append(rel_path)
                 
                 # Generate embedding if not cached
-                processor.get_or_create_embedding(face_path, force_refresh=force_refresh)
-            char_faces_detected += len(existing_faces)
+                emb = processor.get_or_create_embedding(face_path, force_refresh=force_refresh)
+                if emb is not None:
+                    npy_path = face_path.with_suffix(".npy")
+                    face_embedding_paths.append(f"./{npy_path}")
+                char_faces_detected += 1
         else:
             # Detect and crop faces
             try:
@@ -308,80 +333,103 @@ def _process_single_character(
                     face_image_paths.append(rel_path)
                     
                     # Generate and cache embedding
-                    processor.get_or_create_embedding(face_path, force_refresh=True)
-                char_faces_detected += len(saved_faces)
+                    emb = processor.get_or_create_embedding(face_path, force_refresh=True)
+                    if emb is not None:
+                        npy_path = face_path.with_suffix(".npy")
+                        face_embedding_paths.append(f"./{npy_path}")
+                    char_faces_detected += 1
             except Exception as e:
-                print(f"[{idx}/{total_chars}] Error processing {character_name}: {e}")
+                print(f"[{idx}/{total_chars}] Error processing {character_name}: {e}", file=sys.stderr)
+                sys.stderr.flush()
     
     # Log results for this character
-    if char_faces_detected > 0:
-        print(f"[{idx}/{total_chars}] Detected {char_faces_detected} face(s) for {character_name}")
+    if image_embedding_paths or char_faces_detected > 0:
+        print(f"[{idx}/{total_chars}] {character_name}: {len(image_embedding_paths)} full, {char_faces_detected} faces", file=sys.stderr)
+        sys.stderr.flush()
     
-    if face_image_paths:
-        # Update character.json with face paths
-        char_data["face_image_paths"] = face_image_paths
-        with open(character_json_path, 'w', encoding='utf-8') as f:
-            json.dump(char_data, f, indent=2, ensure_ascii=False)
-        return (character_id, face_image_paths, char_faces_detected)
+    # Update character.json with all paths
+    char_data["face_image_paths"] = face_image_paths
+    char_data["face_embedding_paths"] = face_embedding_paths
+    char_data["image_embedding_paths"] = image_embedding_paths
     
-    return None
+    with open(character_json_path, 'w', encoding='utf-8') as f:
+        json.dump(char_data, f, indent=2, ensure_ascii=False)
+    
+    return {
+        "character_id": character_id,
+        "face_image_paths": face_image_paths,
+        "face_embedding_paths": face_embedding_paths,
+        "image_embedding_paths": image_embedding_paths,
+        "faces_detected": char_faces_detected,
+    }
 
 
 def process_character_faces(
     character_ids: Optional[List[str]] = None,
     force_refresh: bool = False,
-    max_workers: int = 4
-) -> Dict[str, List[str]]:
+    max_workers: int = 1  # Ignored now, kept for API compatibility
+) -> Dict[str, Dict[str, List[str]]]:
     """
-    Process faces for characters: detect, crop, and generate embeddings.
-    Uses ThreadPoolExecutor for parallel processing.
+    Process faces and generate embeddings for characters.
+    
+    Generates embeddings for both full character images and cropped face images.
+    Runs sequentially to avoid CUDA race conditions.
     
     Args:
         character_ids: List of character IDs to process. If None, processes all.
         force_refresh: If True, reprocess even if face images exist.
-        max_workers: Number of parallel workers (default: 4)
+        max_workers: Ignored (kept for API compatibility). Processing is sequential.
         
     Returns:
-        Dict mapping character_id to list of face image paths
+        Dict mapping character_id to {"faces": [...], "full_images": [...]}
     """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
     from .faces import AnimeFaceProcessor
     
-    # Initialize processor (this will load models before parallelization)
+    print("[Init] Initializing AnimeFaceProcessor...", file=sys.stderr)
+    sys.stderr.flush()
+    
+    # Initialize processor
     processor = AnimeFaceProcessor()
-    # Pre-load models to avoid race conditions
+    
+    # Pre-load models before processing loop
+    print("[Init] Pre-loading models...", file=sys.stderr)
+    sys.stderr.flush()
     _ = processor.detector
-    _ = processor.clip_model
+    _ = processor.embedding_model
+    _ = processor.embedding_processor
+    print("[Init] Models ready!", file=sys.stderr)
+    sys.stderr.flush()
     
     # Get character directories to process
     if character_ids:
         char_dirs = [INDIVIDUALS_DIR / cid for cid in character_ids if (INDIVIDUALS_DIR / cid).exists()]
     else:
-        char_dirs = [d for d in INDIVIDUALS_DIR.iterdir() if d.is_dir()]
+        char_dirs = sorted([d for d in INDIVIDUALS_DIR.iterdir() if d.is_dir()])
     
     total_chars = len(char_dirs)
-    print(f"Processing faces for {total_chars} characters using {max_workers} workers...")
+    print(f"[Process] Processing {total_chars} characters sequentially...", file=sys.stderr)
+    print("[Process] Generating embeddings for full images + detected faces...", file=sys.stderr)
+    sys.stderr.flush()
     
-    # Prepare arguments for each character
-    args_list = [
-        (char_dir, force_refresh, processor, idx, total_chars)
-        for idx, char_dir in enumerate(char_dirs, 1)
-    ]
-    
-    results: Dict[str, List[str]] = {}
+    results: Dict[str, Dict[str, List[str]]] = {}
     total_faces = 0
+    total_full_images = 0
     
-    # Process in parallel
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_process_single_character, args) for args in args_list]
+    # Process sequentially (CUDA operations don't parallelize well across threads)
+    for idx, char_dir in enumerate(char_dirs, 1):
+        result = _process_single_character(char_dir, force_refresh, processor, idx, total_chars)
         
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                character_id, face_paths, face_count = result
-                results[character_id] = face_paths
-                total_faces += face_count
+        if result:
+            character_id = result["character_id"]
+            results[character_id] = {
+                "faces": result["face_image_paths"],
+                "face_embeddings": result["face_embedding_paths"],
+                "full_images": result["image_embedding_paths"],
+            }
+            total_faces += result["faces_detected"]
+            total_full_images += len(result["image_embedding_paths"])
     
-    print(f"\nCompleted: {total_faces} faces for {len(results)} characters")
+    print(f"\n[Complete] {total_full_images} full images, {total_faces} faces for {len(results)} characters", file=sys.stderr)
+    sys.stderr.flush()
     return results
 

@@ -25,5 +25,7 @@ IMAGE_FILENAME_PATTERN = "image_{idx}{ext}"
 DEFAULT_IMAGE_EXTENSION = ".png"
 
 # Video-related constants
-SAMPLE_VIDEO_PATH = VIDEOS_DIR / "sample.mp4"
+SAMPLE_VIDEO_DIR = VIDEOS_DIR / "sample"
+SAMPLE_VIDEO_PATH = SAMPLE_VIDEO_DIR / "sample.mp4"
+FACE_DETECTIONS_FILENAME_PATTERN = "face-detections-{timestamp}.json"
 

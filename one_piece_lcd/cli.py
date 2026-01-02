@@ -1,18 +1,11 @@
 """CLI entry point for processing wiki data."""
 
 import asyncio
-import json
 import sys
 
 import click
 
 from .constants.paths import INDIVIDUALS_DIR, AFFILIATIONS_DIR, SAMPLE_VIDEO_PATH
-from .processors.character import process_all_characters, process_character_faces
-from .processors.video import VideoFaceRecognition
-from .utils.characters import (
-    get_characters_by_affiliations,
-    get_all_character_ids,
-)
 
 
 @click.group()
@@ -52,6 +45,8 @@ def process_wiki(force_refresh: bool, force_refresh_faces: bool, workers: int):
         
         oplcd process-wiki --force-refresh-faces
     """
+    from .processors.character import process_all_characters, process_character_faces
+    
     # If only refreshing faces, skip the image download step
     if not force_refresh_faces:
         click.echo("Processing wiki to dataset...")
@@ -91,35 +86,48 @@ def process_wiki(force_refresh: bool, force_refresh_faces: bool, workers: int):
     help="Process every Nth frame (default: 5)"
 )
 @click.option(
-    "--tolerance",
-    default=0.6,
+    "--face-tolerance",
+    default=0.5,
     type=float,
-    help="Face matching tolerance, lower = stricter (default: 0.6)"
+    help="Face embedding similarity threshold (0-1, default: 0.5)"
 )
 @click.option(
-    "--gap-threshold",
-    default=1.0,
+    "--char-tolerance",
+    default=0.5,
     type=float,
-    help="Max gap in seconds between detections for same segment (default: 1.0)"
+    help="Full-image character similarity threshold (0-1, default: 0.5)"
+)
+@click.option(
+    "--face-threshold",
+    default=0.3,
+    type=float,
+    help="Face detection confidence threshold (0-1, default: 0.3)"
 )
 def process_video(
     sample: bool,
     video: str | None,
     affiliations: tuple[str, ...],
     frame_skip: int,
-    tolerance: float,
-    gap_threshold: float
+    face_tolerance: float,
+    char_tolerance: float,
+    face_threshold: float,
 ):
-    """Run facial recognition on a video file.
+    """Run character recognition on a video file.
     
-    Outputs JSON to stdout. Progress and summary go to stderr.
+    Uses YOLOv8 AnimeFace for detection and SigLIP for embeddings.
+    Matches both detected faces AND full-frame against character images.
+    
+    Saves results to assets/videos/sample/face-detections-{timestamp}.json
     
     Examples:
     
-        oplcd process-video --sample -a straw_hat_pirates > output.json
+        oplcd process-video --sample -a straw_hat_pirates
         
         oplcd process-video --video path/to/video.mp4 -a straw_hat_pirates -a beasts_pirates
     """
+    from .processors.video import VideoFaceRecognition
+    from .utils.characters import get_characters_by_affiliations, get_all_character_ids
+    
     # Determine video path
     if sample:
         video_path = SAMPLE_VIDEO_PATH
@@ -130,10 +138,11 @@ def process_video(
         sys.exit(1)
     
     # Determine which characters to use
-    if affiliations:
-        characters = get_characters_by_affiliations(list(affiliations))
+    affiliation_list = list(affiliations)
+    if affiliation_list:
+        characters = get_characters_by_affiliations(affiliation_list)
         character_ids = [c["character_id"] for c in characters]
-        click.echo(f"Using {len(character_ids)} characters from affiliations: {', '.join(affiliations)}", err=True)
+        click.echo(f"Using {len(character_ids)} characters from affiliations: {', '.join(affiliation_list)}", err=True)
     else:
         character_ids = get_all_character_ids()
         click.echo(f"Warning: No affiliations specified, using all {len(character_ids)} characters (this may be slow)", err=True)
@@ -143,14 +152,47 @@ def process_video(
         sys.exit(1)
     
     # Initialize and run recognition
-    recognizer = VideoFaceRecognition(video_path)
-    recognizer.load_known_faces(character_ids)
-    recognizer.process_video(frame_skip=frame_skip, tolerance=tolerance)
+    recognizer = VideoFaceRecognition(
+        video_path=video_path,
+        character_ids=character_ids,
+        affiliations=affiliation_list,
+        frame_skip=frame_skip,
+        face_tolerance=face_tolerance,
+        character_tolerance=char_tolerance,
+        face_detection_threshold=face_threshold,
+    )
+    recognizer.process_video()
+    
+    # Save results to file
+    recognizer.save_results()
     
     # Print summary to stderr
-    recognizer.print_summary(gap_threshold=gap_threshold)
-    
-    # Output JSON to stdout
-    results = recognizer.get_results(gap_threshold=gap_threshold)
-    print(json.dumps(results, indent=2))
+    recognizer.print_summary()
 
+
+@cli.command("serve")
+@click.option(
+    "--port",
+    default=3000,
+    type=int,
+    help="Port to run the server on (default: 3000)"
+)
+@click.option(
+    "--host",
+    default="0.0.0.0",
+    help="Host to bind to (default: 0.0.0.0)"
+)
+def serve(port: int, host: str):
+    """Start the face detection viewer web server.
+    
+    Opens a web interface to visualize face detection results
+    overlaid on video playback.
+    
+    Examples:
+    
+        oplcd serve
+        
+        oplcd serve --port 8080
+    """
+    from .server import run_server
+    run_server(host=host, port=port)

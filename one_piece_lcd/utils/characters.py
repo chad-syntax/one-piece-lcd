@@ -81,27 +81,82 @@ def get_characters_by_affiliations(affiliation_ids: list[str]) -> list[dict]:
 
 def get_character_face_paths(character_id: str) -> list[Path]:
     """
-    Get paths to all face images for a character.
+    Get paths to all cropped face images for a character.
+    
+    Reads from character.json's face_image_paths field.
     
     Args:
         character_id: The normalized character ID
         
     Returns:
-        List of Path objects to image files
+        List of Path objects to face image files
     """
-    character_dir = INDIVIDUALS_DIR / character_id
-    
-    if not character_dir.exists():
+    char_data = get_character_json(character_id)
+    if not char_data:
         return []
     
-    # Find all image files in the character directory
-    image_paths: list[Path] = []
+    face_paths = char_data.get("face_image_paths", [])
+    return [Path(p.lstrip("./")) for p in face_paths if Path(p.lstrip("./")).exists()]
+
+
+def get_character_image_paths(character_id: str) -> list[Path]:
+    """
+    Get paths to all full character images (not cropped faces).
     
-    for ext in [".png", ".jpg", ".jpeg", ".webp"]:
-        image_paths.extend(character_dir.glob(f"*{ext}"))
+    Reads from character.json's image_paths field.
     
-    # Sort by filename to ensure consistent ordering
-    return sorted(image_paths)
+    Args:
+        character_id: The normalized character ID
+        
+    Returns:
+        List of Path objects to full image files
+    """
+    char_data = get_character_json(character_id)
+    if not char_data:
+        return []
+    
+    image_paths = char_data.get("image_paths", [])
+    return [Path(p.lstrip("./")) for p in image_paths if Path(p.lstrip("./")).exists()]
+
+
+def get_character_face_embedding_paths(character_id: str) -> list[Path]:
+    """
+    Get paths to all face embedding files for a character.
+    
+    Reads from character.json's face_embedding_paths field.
+    
+    Args:
+        character_id: The normalized character ID
+        
+    Returns:
+        List of Path objects to face embedding .npy files
+    """
+    char_data = get_character_json(character_id)
+    if not char_data:
+        return []
+    
+    embedding_paths = char_data.get("face_embedding_paths", [])
+    return [Path(p.lstrip("./")) for p in embedding_paths if Path(p.lstrip("./")).exists()]
+
+
+def get_character_image_embedding_paths(character_id: str) -> list[Path]:
+    """
+    Get paths to all full image embedding files for a character.
+    
+    Reads from character.json's image_embedding_paths field.
+    
+    Args:
+        character_id: The normalized character ID
+        
+    Returns:
+        List of Path objects to full image embedding .npy files
+    """
+    char_data = get_character_json(character_id)
+    if not char_data:
+        return []
+    
+    embedding_paths = char_data.get("image_embedding_paths", [])
+    return [Path(p.lstrip("./")) for p in embedding_paths if Path(p.lstrip("./")).exists()]
 
 
 def get_all_character_ids() -> list[str]:

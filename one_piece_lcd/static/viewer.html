@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Face Detection Viewer - {{ video_id }}</title>
+    <link rel="stylesheet" href="/static/viewer.css">
+</head>
+<body>
+    <h1>🏴‍☠️ Face Detection Viewer</h1>
+    
+    <div class="video-container">
+        <video id="video" controls>
+            <source src="/api/video/{{ video_id }}/file" type="video/mp4">
+            Your browser does not support video playback.
+        </video>
+        <canvas id="overlay"></canvas>
+    </div>
+    
+    <div class="info">
+        <div>Frame: <span id="frame-num">0</span> | Time: <span id="time">0.00</span>s | Detected: <span id="current-chars">-</span></div>
+        <div class="detected-list" id="all-chars"></div>
+    </div>
+    
+    <div class="timeline-container">
+        <div class="timeline-header">
+            <h3>📊 Character Timeline</h3>
+            <small>Click to seek • Scroll to navigate</small>
+        </div>
+        <div class="timeline-wrapper">
+            <div class="timeline-labels" id="timeline-labels"></div>
+            <div id="timeline-scroll">
+                <div id="timeline-inner">
+                    <div id="timeline-marker"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // Pass video config from server
+        const VIDEO_ID = "{{ video_id }}";
+        const VIDEO_FPS = Number("{{ video_fps }}");
+    </script>
+    <script src="/static/viewer.js"></script>
+</body>
+</html>
