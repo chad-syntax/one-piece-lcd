@@ -89,7 +89,7 @@ class AnimeFaceProcessor:
         if self._embedding_processor is None:
             print(f"[Model] Loading SigLIP processor from {self.SIGLIP_MODEL}...", file=sys.stderr)
             sys.stderr.flush()
-            self._embedding_processor = AutoProcessor.from_pretrained(self.SIGLIP_MODEL)
+            self._embedding_processor = AutoProcessor.from_pretrained(self.SIGLIP_MODEL, use_fast=True)
             print("[Model] SigLIP processor ready!", file=sys.stderr)
             sys.stderr.flush()
         return self._embedding_processor
