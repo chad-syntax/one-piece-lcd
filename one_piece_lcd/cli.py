@@ -75,6 +75,11 @@ def process_wiki(force_refresh: bool, force_refresh_faces: bool, workers: int):
 @click.option("--sample", is_flag=True, help="Use assets/videos/sample.mp4")
 @click.option("--video", type=click.Path(exists=True), help="Path to video file")
 @click.option(
+    "--episode", "-e",
+    type=int,
+    help="Episode number to load characters from (uses scraped episode data)"
+)
+@click.option(
     "--affiliations", "-a",
     multiple=True,
     help="Filter characters by affiliation IDs (can specify multiple)"
@@ -95,7 +100,7 @@ def process_wiki(force_refresh: bool, force_refresh_faces: bool, workers: int):
     "--char-tolerance",
     default=0.5,
     type=float,
-    help="Full-image character similarity threshold (0-1, default: 0.5)"
+    help="Full-image character SigLIP similarity threshold (0-1, default: 0.5)"
 )
 @click.option(
     "--face-threshold",
@@ -103,14 +108,42 @@ def process_wiki(force_refresh: bool, force_refresh_faces: bool, workers: int):
     type=float,
     help="Face detection confidence threshold (0-1, default: 0.3)"
 )
+@click.option(
+    "--face-iou",
+    default=0.5,
+    type=float,
+    help="Face detection IOU threshold for NMS (0-1, default: 0.5, lower = more overlapping)"
+)
+@click.option(
+    "--face-imgsz",
+    default=640,
+    type=int,
+    help="Face detection input size (default: 640, try 1280 for better accuracy)"
+)
+@click.option(
+    "--face-augment",
+    is_flag=True,
+    help="Enable test-time augmentation for face detection (slower but more accurate)"
+)
+@click.option(
+    "--batch-size",
+    default=8,
+    type=int,
+    help="Number of frames to process in parallel (default: 8, increase for faster GPU processing)"
+)
 def process_video(
     sample: bool,
     video: str | None,
+    episode: int | None,
     affiliations: tuple[str, ...],
     frame_skip: int,
     face_tolerance: float,
     char_tolerance: float,
     face_threshold: float,
+    face_iou: float,
+    face_imgsz: int,
+    face_augment: bool,
+    batch_size: int,
 ):
     """Run character recognition on a video file.
     
@@ -121,12 +154,18 @@ def process_video(
     
     Examples:
     
+        oplcd process-video --sample --episode 1
+        
         oplcd process-video --sample -a straw_hat_pirates
         
         oplcd process-video --video path/to/video.mp4 -a straw_hat_pirates -a beasts_pirates
     """
     from .processors.video import VideoFaceRecognition
-    from .utils.characters import get_characters_by_affiliations, get_all_character_ids
+    from .utils.characters import (
+        get_characters_by_affiliations,
+        get_all_character_ids,
+        get_episode_character_ids,
+    )
     
     # Determine video path
     if sample:
@@ -137,15 +176,22 @@ def process_video(
         click.echo("Error: Must specify --sample or --video", err=True)
         sys.exit(1)
     
-    # Determine which characters to use
+    # Determine which characters to use (episode takes priority)
     affiliation_list = list(affiliations)
-    if affiliation_list:
+    
+    if episode is not None:
+        character_ids = get_episode_character_ids(episode)
+        if not character_ids:
+            click.echo(f"Error: No characters found for episode {episode}. Run 'oplcd scrape-episodes' first.", err=True)
+            sys.exit(1)
+        click.echo(f"Using {len(character_ids)} characters from episode {episode}", err=True)
+    elif affiliation_list:
         characters = get_characters_by_affiliations(affiliation_list)
         character_ids = [c["character_id"] for c in characters]
         click.echo(f"Using {len(character_ids)} characters from affiliations: {', '.join(affiliation_list)}", err=True)
     else:
         character_ids = get_all_character_ids()
-        click.echo(f"Warning: No affiliations specified, using all {len(character_ids)} characters (this may be slow)", err=True)
+        click.echo(f"Warning: No episode or affiliations specified, using all {len(character_ids)} characters (this may be slow)", err=True)
     
     if not character_ids:
         click.echo("Error: No characters found to match against", err=True)
@@ -160,6 +206,10 @@ def process_video(
         face_tolerance=face_tolerance,
         character_tolerance=char_tolerance,
         face_detection_threshold=face_threshold,
+        face_iou_threshold=face_iou,
+        face_imgsz=face_imgsz,
+        face_augment=face_augment,
+        batch_size=batch_size,
     )
     recognizer.process_video()
     
@@ -168,6 +218,61 @@ def process_video(
     
     # Print summary to stderr
     recognizer.print_summary()
+
+
+@cli.command("scrape-episodes")
+@click.option(
+    "--start",
+    default=1,
+    type=int,
+    help="Episode number to start from (default: 1)"
+)
+@click.option(
+    "--end",
+    default=None,
+    type=int,
+    help="Episode number to end at (default: scrape until 404)"
+)
+@click.option(
+    "--concurrency",
+    default=20,
+    type=int,
+    help="Number of concurrent requests (default: 20)"
+)
+def scrape_episodes(start: int, end: int | None, concurrency: int):
+    """Scrape episode data from the One Piece Wiki.
+    
+    Fetches episode titles, airdates, and character appearances.
+    Saves data to assets/episodes/<episode_id>/episode.json
+    
+    Examples:
+    
+        oplcd scrape-episodes
+        
+        oplcd scrape-episodes --start 100 --end 200
+        
+        oplcd scrape-episodes --concurrency 10
+    """
+    from .scrapers.episodes import scrape_episodes_parallel
+    
+    scraped_count = 0
+    
+    def on_episode_scraped(episode):
+        nonlocal scraped_count
+        scraped_count += 1
+        click.echo(f"[{scraped_count}] Episode {episode.episode_id}: {episode.title} ({len(episode.characters_in_order_of_appearance)} characters)")
+    
+    end_str = str(end) if end else "end"
+    click.echo(f"Scraping episodes {start}-{end_str} with {concurrency} concurrent requests...")
+    
+    episodes = asyncio.run(scrape_episodes_parallel(
+        start_episode=start,
+        end_episode=end,
+        concurrency=concurrency,
+        on_episode_scraped=on_episode_scraped,
+    ))
+    
+    click.echo(f"\nScraped {len(episodes)} episodes successfully")
 
 
 @cli.command("serve")

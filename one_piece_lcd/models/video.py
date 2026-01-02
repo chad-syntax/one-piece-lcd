@@ -1,13 +1,10 @@
 """Pydantic models for video face recognition output."""
 
-from typing import List
-
+from typing import List, Dict, Optional
 from pydantic import BaseModel, Field
-
 
 class Coordinates(BaseModel):
     """Bounding box coordinates for a detected face."""
-    
     top: int = Field(description="Top edge Y coordinate")
     right: int = Field(description="Right edge X coordinate")
     bottom: int = Field(description="Bottom edge Y coordinate")
@@ -15,32 +12,25 @@ class Coordinates(BaseModel):
     width: int = Field(description="Width of bounding box")
     height: int = Field(description="Height of bounding box")
 
-
 class CharacterCandidate(BaseModel):
     """A possible character match for a detected face or frame."""
-    
     character_id: str = Field(description="ID of the matched character ('unknown' if no match)")
     confidence: float = Field(description="Match confidence score (0-1)")
 
-
 class FaceDetection(BaseModel):
     """A detected face with possible character matches."""
-    
     coordinates: Coordinates = Field(description="Bounding box of the detected face")
     candidates: List[CharacterCandidate] = Field(
         default_factory=list,
         description="Possible character matches from face embeddings, sorted by confidence"
     )
-    
     @property
-    def best_match(self) -> CharacterCandidate | None:
+    def best_match(self) -> Optional[CharacterCandidate]:
         """Get the highest confidence match."""
         return self.candidates[0] if self.candidates else None
 
-
 class CharacterMatch(BaseModel):
-    """A character match from full-frame or full-body embedding comparison."""
-    
+    """A character match from full-frame or full-body embedding comparison (SigLIP)."""
     character_id: str = Field(description="ID of the matched character")
     confidence: float = Field(description="Match confidence score (0-1)")
     match_type: str = Field(
@@ -48,24 +38,31 @@ class CharacterMatch(BaseModel):
         description="Type of embedding match: 'full_image' or 'face_image'"
     )
 
-
 class FrameData(BaseModel):
     """Detection data for a single video frame."""
-    
     frame_number: int = Field(description="Frame number in the video")
     faces: List[FaceDetection] = Field(
         default_factory=list,
-        description="Detected faces with character candidates (from face detection + face embeddings)"
+        description="Detected faces with character candidates (SigLIP face embeddings)"
     )
     characters: List[CharacterMatch] = Field(
         default_factory=list,
-        description="Characters matched from full-frame embedding comparison (no bounding box)"
+        description="Characters from full-frame SigLIP embedding comparison"
     )
 
+class VideoProcessingStatistics(BaseModel):
+    """Summary timing statistics for different pipeline stages."""
+    detection: Dict[str, float] = Field(description="Timings for detection (avg, min, max, count)")
+    frame_embedding: Dict[str, float] = Field(description="Timings for frame embedding (avg, min, max, count)")
+    frame_matching: Dict[str, float] = Field(description="Timings for frame matching (avg, min, max, count)")
+    cropping: Dict[str, float] = Field(description="Timings for cropping (avg, min, max, count)")
+    face_embedding: Dict[str, float] = Field(description="Timings for face embedding (avg, min, max, count)")
+    face_matching: Dict[str, float] = Field(description="Timings for face matching (avg, min, max, count)")
+    organizing: Dict[str, float] = Field(description="Timings for organizing (avg, min, max, count)")
+    batch_total: Dict[str, float] = Field(description="Timings for batch total (avg, min, max, count)")
 
 class VideoProcessingConfig(BaseModel):
     """Configuration used for video processing."""
-    
     frame_skip: int = Field(description="Interval between processed frames")
     processing_duration_seconds: float = Field(description="How long the processing took in seconds")
     face_detection_threshold: float = Field(
@@ -74,11 +71,11 @@ class VideoProcessingConfig(BaseModel):
     )
     face_match_tolerance: float = Field(
         default=0.5,
-        description="Similarity threshold for face embedding matching"
+        description="Similarity threshold for face embedding matching (SigLIP)"
     )
     character_match_tolerance: float = Field(
         default=0.5,
-        description="Similarity threshold for full-frame character matching"
+        description="Similarity threshold for full-frame SigLIP matching"
     )
     target_affiliations: List[str] = Field(
         default_factory=list,
@@ -93,14 +90,16 @@ class VideoProcessingConfig(BaseModel):
         description="Unique character IDs that were actually detected"
     )
 
-
 class VideoFaceRecognitionResult(BaseModel):
     """Complete result of video face recognition processing."""
-    
     video_path: str = Field(description="Path to the processed video file")
     total_frames: int = Field(description="Total number of frames processed")
     config: VideoProcessingConfig = Field(description="Processing configuration and detection summary")
     frame_data: List[FrameData] = Field(
         default_factory=list,
         description="Per-frame detection data (only frames with detections)"
+    )
+    statistics: Optional[VideoProcessingStatistics] = Field(
+        default=None,
+        description="Pipeline timing statistics for the run"
     )

@@ -7,6 +7,7 @@ from typing import Optional
 from ..constants.paths import (
     INDIVIDUALS_DIR,
     AFFILIATIONS_DIR,
+    EPISODES_WIKI_JSON_PATH,
     CHARACTER_JSON_FILENAME,
     DEFAULT_IMAGE_EXTENSION,
 )
@@ -141,7 +142,7 @@ def get_character_face_embedding_paths(character_id: str) -> list[Path]:
 
 def get_character_image_embedding_paths(character_id: str) -> list[Path]:
     """
-    Get paths to all full image embedding files for a character.
+    Get paths to all full image embedding files for a character (SigLIP).
     
     Reads from character.json's image_embedding_paths field.
     
@@ -172,5 +173,53 @@ def get_all_character_ids() -> list[str]:
     return [
         d.name for d in INDIVIDUALS_DIR.iterdir()
         if d.is_dir() and (d / CHARACTER_JSON_FILENAME).exists()
+    ]
+
+
+def get_episode_json(episode_id: int) -> Optional[dict]:
+    """
+    Load episode JSON data by episode ID.
+    
+    Args:
+        episode_id: The episode number (e.g., 1, 100, 1155)
+        
+    Returns:
+        Episode data dict, or None if not found
+    """
+    if not EPISODES_WIKI_JSON_PATH.exists():
+        return None
+    
+    with open(EPISODES_WIKI_JSON_PATH, "r", encoding="utf-8") as f:
+        episodes_data = json.load(f)
+    
+    return episodes_data.get(str(episode_id))
+
+
+def get_episode_character_ids(episode_id: int) -> list[str]:
+    """
+    Get list of character IDs that appear in an episode.
+    
+    Only returns character IDs that exist in our dataset
+    (have face embeddings available).
+    
+    Args:
+        episode_id: The episode number
+        
+    Returns:
+        List of character IDs that appear in the episode
+        and have face data available
+    """
+    episode_data = get_episode_json(episode_id)
+    if not episode_data:
+        return []
+    
+    # Get all available character IDs in our dataset
+    available_ids = set(get_all_character_ids())
+    
+    # Filter to only characters we have data for
+    episode_characters = episode_data.get("characters_in_order_of_appearance", [])
+    return [
+        char_id for char_id in episode_characters
+        if char_id in available_ids
     ]
 

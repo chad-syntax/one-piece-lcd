@@ -271,7 +271,7 @@ def _process_single_character(
 ) -> Optional[Dict[str, Any]]:
     """Process faces and generate embeddings for a single character.
     
-    Generates embeddings for:
+    Generates SigLIP embeddings for:
     - Full character images (image_1.png -> image_1.npy)
     - Cropped face images (image_1_face_1.png -> image_1_face_1.npy)
     
@@ -303,7 +303,7 @@ def _process_single_character(
         if not abs_path.exists():
             continue
         
-        # Generate embedding for full character image
+        # Generate SigLIP embedding for full character image
         embedding = processor.get_or_create_embedding(abs_path, force_refresh=force_refresh)
         if embedding is not None:
             npy_path = abs_path.with_suffix(".npy")
@@ -318,11 +318,12 @@ def _process_single_character(
                 rel_path = f"./{face_path}"
                 face_image_paths.append(rel_path)
                 
-                # Generate embedding if not cached
+                # Generate SigLIP embedding if not cached
                 emb = processor.get_or_create_embedding(face_path, force_refresh=force_refresh)
                 if emb is not None:
                     npy_path = face_path.with_suffix(".npy")
                     face_embedding_paths.append(f"./{npy_path}")
+                
                 char_faces_detected += 1
         else:
             # Detect and crop faces
@@ -332,11 +333,12 @@ def _process_single_character(
                     rel_path = f"./{face_path}"
                     face_image_paths.append(rel_path)
                     
-                    # Generate and cache embedding
+                    # Generate and cache SigLIP embedding
                     emb = processor.get_or_create_embedding(face_path, force_refresh=True)
                     if emb is not None:
                         npy_path = face_path.with_suffix(".npy")
                         face_embedding_paths.append(f"./{npy_path}")
+                    
                     char_faces_detected += 1
             except Exception as e:
                 print(f"[{idx}/{total_chars}] Error processing {character_name}: {e}", file=sys.stderr)

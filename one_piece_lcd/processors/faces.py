@@ -60,8 +60,9 @@ class AnimeFaceProcessor:
             
             print("[Model] Initializing YOLO detector...", file=sys.stderr)
             sys.stderr.flush()
+            # YOLO will use device parameter during inference, no need for .to()
             self._detector = YOLO(model_path)
-            print("[Model] YOLOv8 AnimeFace detector ready!", file=sys.stderr)
+            print(f"[Model] YOLOv8 AnimeFace detector ready on {self.device}!", file=sys.stderr)
             sys.stderr.flush()
         return self._detector
     
@@ -76,7 +77,9 @@ class AnimeFaceProcessor:
             sys.stderr.flush()
             self._embedding_model = self._embedding_model.to(self.device)
             self._embedding_model.eval()
-            print("[Model] SigLIP model ready!", file=sys.stderr)
+            # Verify model is on correct device
+            model_device = next(self._embedding_model.parameters()).device
+            print(f"[Model] SigLIP model ready on {model_device}!", file=sys.stderr)
             sys.stderr.flush()
         return self._embedding_model
     
@@ -91,13 +94,25 @@ class AnimeFaceProcessor:
             sys.stderr.flush()
         return self._embedding_processor
     
-    def detect_faces(self, image: np.ndarray | str | Path, conf_threshold: float = 0.3) -> list[dict]:
+    def detect_faces(
+        self,
+        image: np.ndarray | str | Path,
+        conf_threshold: float = 0.3,
+        iou_threshold: float = 0.5,
+        imgsz: int = 640,
+        augment: bool = False,
+        max_det: int = 100,
+    ) -> list[dict]:
         """
         Detect anime faces in an image.
         
         Args:
             image: Image as numpy array (BGR), or path to image file
-            conf_threshold: Minimum confidence threshold
+            conf_threshold: Minimum confidence threshold (lower = more detections)
+            iou_threshold: IOU threshold for NMS (lower = allow more overlapping boxes)
+            imgsz: Input image size for detection (larger = more accurate, slower)
+            augment: Enable test-time augmentation (TTA) for better accuracy
+            max_det: Maximum number of detections per image
             
         Returns:
             List of detected faces with bounding boxes:
@@ -109,8 +124,19 @@ class AnimeFaceProcessor:
                 return []
             image = loaded
         
-        # Run detection
-        results = self.detector(image, conf=conf_threshold, verbose=False)
+        # Run detection with tunable parameters
+        # Pass device explicitly to ensure GPU usage (use 0 for cuda:0)
+        device_param = 0 if self.device == "cuda" and torch.cuda.is_available() else self.device
+        results = self.detector(
+            image,
+            conf=conf_threshold,
+            iou=iou_threshold,
+            imgsz=imgsz,
+            augment=augment,
+            max_det=max_det,
+            device=device_param,  # YOLO expects 0 for cuda:0, or "cpu"
+            verbose=False,
+        )
         
         faces = []
         for result in results:
@@ -127,18 +153,92 @@ class AnimeFaceProcessor:
         
         return faces
     
-    def detect_faces_in_frame(self, frame: np.ndarray, conf_threshold: float = 0.3) -> list[dict]:
+    def detect_faces_in_frame(
+        self,
+        frame: np.ndarray,
+        conf_threshold: float = 0.3,
+        iou_threshold: float = 0.5,
+        imgsz: int = 640,
+        augment: bool = False,
+        max_det: int = 100,
+    ) -> list[dict]:
         """
         Detect faces in a video frame (convenience method).
         
         Args:
             frame: BGR numpy array from cv2.VideoCapture
             conf_threshold: Minimum confidence threshold
+            iou_threshold: IOU threshold for NMS
+            imgsz: Input image size for detection
+            augment: Enable test-time augmentation
+            max_det: Maximum number of detections
             
         Returns:
             List of detected faces with bounding boxes
         """
-        return self.detect_faces(frame, conf_threshold)
+        return self.detect_faces(
+            frame,
+            conf_threshold=conf_threshold,
+            iou_threshold=iou_threshold,
+            imgsz=imgsz,
+            augment=augment,
+            max_det=max_det,
+        )
+    
+    def detect_faces_batch(
+        self,
+        images: list[np.ndarray],
+        conf_threshold: float = 0.3,
+        iou_threshold: float = 0.5,
+        imgsz: int = 640,
+        augment: bool = False,
+        max_det: int = 100,
+    ) -> list[list[dict]]:
+        """
+        Detect faces in a batch of images (much faster on GPU).
+        
+        Args:
+            images: List of BGR numpy arrays from cv2.VideoCapture
+            conf_threshold: Minimum confidence threshold
+            iou_threshold: IOU threshold for NMS
+            imgsz: Input image size for detection
+            augment: Enable test-time augmentation
+            max_det: Maximum number of detections per image
+            
+        Returns:
+            List of detection results, one per input image
+        """
+        if not images:
+            return []
+        
+        # Run batch detection (YOLOv8 handles batching automatically)
+        # Pass device explicitly to ensure GPU usage (use 0 for cuda:0)
+        device_param = 0 if self.device == "cuda" and torch.cuda.is_available() else self.device
+        results = self.detector(
+            images,
+            conf=conf_threshold,
+            iou=iou_threshold,
+            imgsz=imgsz,
+            augment=augment,
+            max_det=max_det,
+            device=device_param,  # YOLO expects 0 for cuda:0, or "cpu"
+            verbose=False,
+        )
+        
+        # Convert results to our format
+        batch_detections = []
+        for result in results:
+            faces = []
+            if result.boxes is not None:
+                for box in result.boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    conf = float(box.conf[0].cpu().numpy())
+                    faces.append({
+                        "bbox": np.array([x1, y1, x2, y2, conf])
+                    })
+            batch_detections.append(faces)
+        
+        return batch_detections
     
     def crop_face(
         self,
@@ -272,8 +372,9 @@ class AnimeFaceProcessor:
         with torch.no_grad():
             outputs = self.embedding_model.get_image_features(**inputs)
         
-        # Normalize the embeddings
+        # Normalize the embeddings (keep on GPU for now)
         embeddings = outputs / outputs.norm(p=2, dim=-1, keepdim=True)
+        # Transfer to CPU in one batch operation
         embeddings_np = embeddings.cpu().numpy()
         
         return [embeddings_np[i].flatten() for i in range(len(images))]
@@ -391,10 +492,13 @@ def find_best_match(
     return None
 
 
+from typing import Sequence, Mapping
+
 def find_all_matches(
     query_embedding: np.ndarray,
-    reference_embeddings: dict[str, list[np.ndarray]],
-    threshold: float = 0.5
+    reference_embeddings: Mapping[str, Sequence[np.ndarray | torch.Tensor]],
+    threshold: float = 0.5,
+    device: Optional[str] = None,
 ) -> list[tuple[str, float]]:
     """
     Find all matching characters above threshold for a query embedding.
@@ -403,10 +507,30 @@ def find_all_matches(
         query_embedding: The embedding to match
         reference_embeddings: Dict of character_id -> list of embeddings
         threshold: Minimum similarity threshold
+        device: Device to use for GPU acceleration ('cuda' or None for CPU)
         
     Returns:
         List of (character_id, best_similarity) tuples, sorted by similarity descending
     """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Use GPU-accelerated matching if available
+    if device == "cuda" and torch.cuda.is_available():
+        # Defensive: convert sequences/possible tensors to ndarrays if needed
+        ref_dict = {k: [e.detach().cpu().numpy() if isinstance(e, torch.Tensor) else e for e in v] for k, v in reference_embeddings.items()}
+        return _find_all_matches_gpu(query_embedding, ref_dict, threshold, device)
+    else:
+        ref_dict = {k: [e.detach().cpu().numpy() if isinstance(e, torch.Tensor) else e for e in v] for k, v in reference_embeddings.items()}
+        return _find_all_matches_cpu(query_embedding, ref_dict, threshold)
+
+
+def _find_all_matches_cpu(
+    query_embedding: np.ndarray,
+    reference_embeddings: dict[str, list[np.ndarray]],
+    threshold: float = 0.5
+) -> list[tuple[str, float]]:
+    """CPU-based matching (original implementation)."""
     matches: dict[str, float] = {}
     
     for character_id, embeddings in reference_embeddings.items():
@@ -422,3 +546,140 @@ def find_all_matches(
     # Sort by similarity descending
     sorted_matches = sorted(matches.items(), key=lambda x: x[1], reverse=True)
     return sorted_matches
+
+
+def _find_all_matches_gpu(
+    query_embedding: np.ndarray,
+    reference_embeddings: dict[str, list[np.ndarray]],
+    threshold: float = 0.5,
+    device: str = "cuda",
+) -> list[tuple[str, float]]:
+    """GPU-accelerated matching using PyTorch."""
+    # Convert query to tensor
+    query_tensor = torch.from_numpy(query_embedding).float().to(device)
+    
+    matches: dict[str, float] = {}
+    
+    # Process all embeddings for each character at once
+    for character_id, embeddings in reference_embeddings.items():
+        if not embeddings:
+            continue
+        
+        # Stack all reference embeddings for this character
+        ref_tensor = torch.from_numpy(np.stack(embeddings)).float().to(device)
+        
+        # Compute cosine similarity (dot product since embeddings are normalized)
+        similarities = torch.matmul(ref_tensor, query_tensor)
+        
+        # Get best similarity
+        best_sim = float(torch.max(similarities).cpu().item())
+        
+        if best_sim >= threshold:
+            matches[character_id] = best_sim
+    
+    # Sort by similarity descending
+    sorted_matches = sorted(matches.items(), key=lambda x: x[1], reverse=True)
+    return sorted_matches
+
+
+from typing import Sequence, Any
+
+from typing import Sequence, Mapping
+
+def find_all_matches_batch(
+    query_embeddings: Sequence[np.ndarray | torch.Tensor],
+    reference_embeddings: Mapping[str, Sequence[np.ndarray | torch.Tensor]],
+    threshold: float = 0.5,
+    device: Optional[str] = None,
+) -> list[list[tuple[str, float]]]:
+    """
+    Find matches for a batch of query embeddings (much faster on GPU).
+    
+    Args:
+        query_embeddings: List of embeddings to match
+        reference_embeddings: Dict of character_id -> list of embeddings
+        threshold: Minimum similarity threshold
+        device: Device to use for GPU acceleration
+    
+    Returns:
+        List of match results, one per query embedding
+    """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    if not query_embeddings:
+        return []
+    
+    if device == "cuda" and torch.cuda.is_available():
+        # If both queries and refs are torch tensors, skip conversion
+        # Assume pre-loaded as CUDA tensors
+        use_cuda_tensors = isinstance(next(iter(reference_embeddings.values()))[0], torch.Tensor)
+        return _find_all_matches_batch_gpu(query_embeddings, reference_embeddings, threshold, device, use_cuda_tensors)
+    else:
+        # Fallback to CPU for each
+        # Fix type: Only pass the np.ndarray branch to CPU matcher
+        results = []
+        for emb in query_embeddings:
+            if isinstance(emb, torch.Tensor):
+                emb_np = emb.detach().cpu().numpy()
+            else:
+                emb_np = emb
+            # Convert Mapping[str, Sequence[ndarray|Tensor]] -> dict[str, list[ndarray]]
+            ref_np = {k: [e.detach().cpu().numpy() if isinstance(e, torch.Tensor) else e for e in v] for k, v in reference_embeddings.items()}
+            results.append(_find_all_matches_cpu(emb_np, ref_np, threshold))
+        return results
+
+
+
+from typing import Mapping
+
+def _find_all_matches_batch_gpu(
+    query_embeddings: Sequence[np.ndarray | torch.Tensor],
+    reference_embeddings: Mapping[str, Sequence[np.ndarray | torch.Tensor]],
+    threshold: float = 0.5,
+    device: str = "cuda",
+    use_cuda_tensors: bool = False,
+) -> list[list[tuple[str, float]]]:
+    """GPU-accelerated batch matching (now supports persistent CUDA tensors)."""
+    # Defensive: ensure all query embeddings are tensors or ndarrays
+    if use_cuda_tensors:
+        # Assume already loaded as CUDA tensors (avoid conversion/copy)
+        query_tensor = torch.stack([e if isinstance(e, torch.Tensor) else torch.from_numpy(e) for e in query_embeddings]).float().to(device)
+    else:
+        query_tensor = torch.from_numpy(np.stack([e if isinstance(e, np.ndarray) else e.detach().cpu().numpy() for e in query_embeddings])).float().to(device)
+
+    all_ref_embeddings: list[torch.Tensor] = []
+    char_ids: list[str] = []
+    for character_id, embeddings in reference_embeddings.items():
+        if not embeddings:
+            continue
+        if use_cuda_tensors:
+            ref_tensor = torch.stack([e if isinstance(e, torch.Tensor) else torch.from_numpy(e) for e in embeddings]).float().to(device)
+        else:
+            ref_tensor = torch.from_numpy(np.stack([e if isinstance(e, np.ndarray) else e.detach().cpu().numpy() for e in embeddings])).float().to(device)
+        all_ref_embeddings.append(ref_tensor)
+        char_ids.append(character_id)
+    
+    if not all_ref_embeddings:
+        return [[] for _ in query_embeddings]
+    
+    all_best_sims = []
+    for ref_tensor in all_ref_embeddings:
+        similarities = torch.matmul(query_tensor, ref_tensor.t())
+        best_sims = torch.max(similarities, dim=1)[0]
+        all_best_sims.append(best_sims)
+    if all_best_sims:
+        all_best_sims_tensor = torch.stack(all_best_sims)  # (num_chars, batch_size)
+        all_best_sims_cpu = all_best_sims_tensor.cpu().numpy()  # Single CPU transfer
+    else:
+        all_best_sims_cpu = np.array([])
+    results = []
+    for i in range(len(query_embeddings)):
+        matches = []
+        for char_idx, char_id in enumerate(char_ids):
+            sim = float(all_best_sims_cpu[char_idx, i])
+            if sim >= threshold:
+                matches.append((char_id, sim))
+        matches.sort(key=lambda x: x[1], reverse=True)
+        results.append(matches)
+    return results

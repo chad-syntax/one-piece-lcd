@@ -65,16 +65,11 @@ function buildTimeline() {
     for (const frame of sortedFrames) {
         const frameChars = new Set();
         
-        // Add characters from face detections
+        // Add characters from face detections only
         for (const face of (frame.faces || [])) {
             if (face.candidates && face.candidates.length > 0) {
                 frameChars.add(face.candidates[0].character_id);
             }
-        }
-        
-        // Add characters from full-frame matching
-        for (const char of (frame.characters || [])) {
-            frameChars.add(char.character_id);
         }
         
         // Check for characters that ended

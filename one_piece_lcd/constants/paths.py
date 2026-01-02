@@ -20,6 +20,9 @@ ALL_CHARACTERS_JSON_PATH = CHARACTERS_DIR / AFFILIATIONS_DIR_NAME / "all_charact
 # File names (relative to directories)
 CHARACTER_JSON_FILENAME = "character.json"
 
+# Data files
+EPISODES_WIKI_JSON_PATH = ASSETS_DIR / "one-piece-episodes-wiki.json"
+
 # Image-related constants
 IMAGE_FILENAME_PATTERN = "image_{idx}{ext}"
 DEFAULT_IMAGE_EXTENSION = ".png"
