@@ -5,7 +5,7 @@ import sys
 
 import click
 
-from .constants.paths import INDIVIDUALS_DIR, AFFILIATIONS_DIR, SAMPLE_VIDEO_PATH
+from .constants.paths import INDIVIDUALS_DIR, AFFILIATIONS_DIR, VIDEOS_DIR, SAMPLE_VIDEO_PATH
 
 
 @click.group()
@@ -72,12 +72,14 @@ def process_wiki(force_refresh: bool, force_refresh_faces: bool, workers: int):
 
 
 @cli.command("process-video")
-@click.option("--sample", is_flag=True, help="Use assets/videos/sample.mp4")
-@click.option("--video", type=click.Path(exists=True), help="Path to video file")
 @click.option(
-    "--episode", "-e",
-    type=int,
-    help="Episode number to load characters from (uses scraped episode data)"
+    "--sample",
+    is_flag=True,
+    help="Use sample video at assets/videos/sample/sample.mp4"
+)
+@click.option(
+    "--episode-id",
+    help="Episode ID (e.g., '24'). Video should be at assets/videos/{episode_id}/{episode_id}.mkv. If numeric, will use that episode's characters. Can be used with --sample to use sample video with episode characters."
 )
 @click.option(
     "--affiliations", "-a",
@@ -133,8 +135,7 @@ def process_wiki(force_refresh: bool, force_refresh_faces: bool, workers: int):
 )
 def process_video(
     sample: bool,
-    video: str | None,
-    episode: int | None,
+    episode_id: str | None,
     affiliations: tuple[str, ...],
     frame_skip: int,
     face_tolerance: float,
@@ -150,15 +151,24 @@ def process_video(
     Uses YOLOv8 AnimeFace for detection and SigLIP for embeddings.
     Matches both detected faces AND full-frame against character images.
     
-    Saves results to assets/videos/sample/face-detections-{timestamp}.json
+    Either --sample or --episode-id must be specified for the video source.
+    --episode-id can also be used with --sample to specify which episode's characters to use.
+    
+    Video file should be at: assets/videos/{episode_id}/{episode_id}.mkv (or sample.mp4 for --sample)
+    Saves results to: assets/videos/{episode_id}/face-detections-{timestamp}.json
+    
+    If episode_id is numeric, will automatically use characters from that episode.
+    Otherwise, use --affiliations to filter characters, or all characters will be used.
     
     Examples:
     
-        oplcd process-video --sample --episode 1
+        oplcd process-video --sample
         
-        oplcd process-video --sample -a straw_hat_pirates
+        oplcd process-video --episode-id 24
         
-        oplcd process-video --video path/to/video.mp4 -a straw_hat_pirates -a beasts_pirates
+        oplcd process-video --sample --episode-id 24
+        
+        oplcd process-video --episode-id 24 -a straw_hat_pirates
     """
     from .processors.video import VideoFaceRecognition
     from .utils.characters import (
@@ -170,28 +180,46 @@ def process_video(
     # Determine video path
     if sample:
         video_path = SAMPLE_VIDEO_PATH
-    elif video:
-        video_path = video
+        video_dir = VIDEOS_DIR / "sample"
+        if not video_path.exists():
+            click.echo(f"Error: Sample video file not found at {video_path}", err=True)
+            sys.exit(1)
+    elif episode_id:
+        video_dir = VIDEOS_DIR / episode_id
+        video_path = video_dir / f"{episode_id}.mkv"
+        if not video_path.exists():
+            click.echo(f"Error: Video file not found at {video_path}", err=True)
+            click.echo(f"Expected path: assets/videos/{episode_id}/{episode_id}.mkv", err=True)
+            sys.exit(1)
     else:
-        click.echo("Error: Must specify --sample or --video", err=True)
+        click.echo("Error: Must specify either --sample or --episode-id", err=True)
         sys.exit(1)
     
-    # Determine which characters to use (episode takes priority)
+    # Determine which characters to use
+    # Try to parse episode_id as integer to use episode-based character filtering
     affiliation_list = list(affiliations)
+    episode_num = None
     
-    if episode is not None:
-        character_ids = get_episode_character_ids(episode)
+    if episode_id:
+        try:
+            episode_num = int(episode_id)
+        except ValueError:
+            # episode_id is not a number, so we can't use episode-based character filtering
+            pass
+    
+    if episode_num is not None:
+        character_ids = get_episode_character_ids(episode_num)
         if not character_ids:
-            click.echo(f"Error: No characters found for episode {episode}. Run 'oplcd scrape-episodes' first.", err=True)
+            click.echo(f"Error: No characters found for episode {episode_num}. Run 'oplcd scrape-episodes' first.", err=True)
             sys.exit(1)
-        click.echo(f"Using {len(character_ids)} characters from episode {episode}", err=True)
+        click.echo(f"Using {len(character_ids)} characters from episode {episode_num}", err=True)
     elif affiliation_list:
         characters = get_characters_by_affiliations(affiliation_list)
         character_ids = [c["character_id"] for c in characters]
         click.echo(f"Using {len(character_ids)} characters from affiliations: {', '.join(affiliation_list)}", err=True)
     else:
         character_ids = get_all_character_ids()
-        click.echo(f"Warning: No episode or affiliations specified, using all {len(character_ids)} characters (this may be slow)", err=True)
+        click.echo(f"Warning: episode_id '{episode_id}' is not numeric and no affiliations specified, using all {len(character_ids)} characters (this may be slow)", err=True)
     
     if not character_ids:
         click.echo("Error: No characters found to match against", err=True)
@@ -210,6 +238,7 @@ def process_video(
         face_imgsz=face_imgsz,
         face_augment=face_augment,
         batch_size=batch_size,
+        output_dir=video_dir,  # Save results to the episode directory
     )
     recognizer.process_video()
     

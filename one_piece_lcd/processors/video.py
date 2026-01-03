@@ -3,17 +3,18 @@ Video character recognition using YOLOv8 AnimeFace + SigLIP embeddings (CPU & GP
 """
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
-from queue import Empty, Queue
-from threading import Event, Lock, Thread
-from typing import List, Optional, Sequence, Mapping
+import traceback
+import gc
 import cv2
 import numpy as np
 import torch
 from PIL import Image
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+from queue import Empty, Queue
+from threading import Lock, Thread
+from typing import List, Optional, Sequence
 from ..constants.paths import SAMPLE_VIDEO_DIR, FACE_DETECTIONS_FILENAME_PATTERN
 from ..models.video import (
     CharacterCandidate,
@@ -21,35 +22,17 @@ from ..models.video import (
     Coordinates,
     FaceDetection,
     FrameData,
+    GPUResult,
+    GPUWorkItem,
     VideoFaceRecognitionResult,
     VideoProcessingConfig,
+    VideoProcessingStatistics,
 )
 from ..utils.characters import (
     get_character_face_embedding_paths,
     get_character_image_embedding_paths,
 )
 from .faces import AnimeFaceProcessor, find_all_matches, find_all_matches_batch
-
-@dataclass
-class GPUWorkItem:
-    batch_id: int
-    frame_batch: List[tuple[int, np.ndarray]]
-    face_crops: List[Image.Image]
-    face_coords: List[tuple[int, int, int, int]]
-    frame_face_indices: List[List[int]]
-    frame_pils: List[Image.Image]
-    detections: List[List[dict]]
-
-@dataclass
-class GPUResult:
-    batch_id: int
-    frame_batch: List[tuple[int, np.ndarray]]
-    detections: List[List[dict]]
-    frame_face_indices: List[List[int]]
-    all_face_coords: List[tuple[int, int, int, int]]
-    batch_matches: List[List[tuple[str, float]]]
-    batch_frame_matches: List[List[tuple[str, float]]]
-    all_face_embs: Optional[List[np.ndarray]]
 
 
 class VideoFaceRecognition:
@@ -67,6 +50,7 @@ class VideoFaceRecognition:
         face_imgsz: int = 640,
         face_augment: bool = False,
         batch_size: int = 8,
+        output_dir: Optional[Path] = None,
     ):
         self.video_path = str(video_path)
         self.character_ids = character_ids
@@ -79,8 +63,6 @@ class VideoFaceRecognition:
         self.face_imgsz = face_imgsz
         self.face_augment = face_augment
         self.batch_size = batch_size
-        # Embeddings
-        from typing import Sequence
 
         self.face_embeddings: dict[str, Sequence[np.ndarray | torch.Tensor]] = {}
         self.full_image_embeddings: dict[str, Sequence[np.ndarray | torch.Tensor]] = {}
@@ -91,9 +73,11 @@ class VideoFaceRecognition:
         self.processing_duration_seconds: float = 0.0
         self.processor: AnimeFaceProcessor = AnimeFaceProcessor()
         self.output_path: Optional[Path] = None
+        self.output_dir: Path = output_dir if output_dir is not None else SAMPLE_VIDEO_DIR
         # Timing/stat lists
         self.detect_timings = []
-        self.frame_emb_timings = []
+        self.frame_pil_timings = []  # PIL conversion timing
+        self.frame_emb_timings = []  # Frame embedding generation timing
         self.frame_match_timings = []
         self.crop_timings = []
         self.face_emb_timings = []
@@ -138,7 +122,7 @@ class VideoFaceRecognition:
         print(f"Loaded {face_count} face + {full_count} full-image embeddings for {chars_with_embeddings} characters\n", file=sys.stderr)
 
     def process_video(self) -> None:
-        start_time = time.time()
+        start_time = time.perf_counter()
         print(f"Processing video: {self.video_path}", file=sys.stderr)
         video = cv2.VideoCapture(self.video_path)  # type: ignore[attr-defined]
         fps = video.get(cv2.CAP_PROP_FPS)  # type: ignore[attr-defined]
@@ -153,7 +137,7 @@ class VideoFaceRecognition:
             print("No embeddings loaded, cannot process video.", file=sys.stderr)
             return
         # Queues for producer-consumer pattern
-        frame_queue: Queue[Optional[tuple[int, np.ndarray]]] = Queue(maxsize=min(self.batch_size * 2, 32))
+        frame_queue: Queue[Optional[tuple[int, np.ndarray]]] = Queue(maxsize=self.batch_size * 2)
         gpu_work_queue: Queue[Optional[GPUWorkItem]] = Queue(maxsize=2)
         result_queue: Queue[Optional[GPUResult]] = Queue(maxsize=2)
         batch_counter_lock = Lock()
@@ -226,7 +210,6 @@ class VideoFaceRecognition:
                         frame_batch = []
             except Exception as e:
                 print(f"Error in detection worker: {e}", file=sys.stderr)
-                import traceback
                 traceback.print_exc()
         def gpu_processor():
             try:
@@ -239,17 +222,14 @@ class VideoFaceRecognition:
                         result = self._process_gpu_work_item(work_item)
                         result_queue.put(result, timeout=10.0)
                         del work_item
-                        import gc
                         gc.collect()
                     except Exception as e:
                         print(f"Error processing GPU work item: {e}", file=sys.stderr)
-                        import traceback
                         traceback.print_exc()
                     finally:
                         gpu_work_queue.task_done()
             except Exception as e:
                 print(f"Error in GPU processor: {e}", file=sys.stderr)
-                import traceback
                 traceback.print_exc()
         def result_writer():
             try:
@@ -263,10 +243,9 @@ class VideoFaceRecognition:
                         processed_count += len(result.frame_batch)
                         if processed_count % 20 == 0:
                             progress = (processed_count * self.frame_skip / total_frames) * 100
-                            elapsed = time.time() - start_time
+                            elapsed = time.perf_counter() - start_time
                             print(f"Progress: {progress:.1f}% ({processed_count * self.frame_skip}/{total_frames}) - {elapsed:.1f}s", file=sys.stderr)
                         del result
-                        import gc
                         gc.collect()
                     except Exception as e:
                         print(f"Error writing result: {e}", file=sys.stderr)
@@ -275,7 +254,6 @@ class VideoFaceRecognition:
                 self.total_frames_processed = processed_count
             except Exception as e:
                 print(f"Error in result writer: {e}", file=sys.stderr)
-                import traceback
                 traceback.print_exc()
         # Launch threads
         reader_thread = Thread(target=read_frames, daemon=False)
@@ -290,15 +268,14 @@ class VideoFaceRecognition:
         detection_thread.join()
         gpu_thread.join()
         writer_thread.join()
-        self.processing_duration_seconds = time.time() - start_time
+        self.processing_duration_seconds = time.perf_counter() - start_time
         print(f"\n✓ Video processing complete in {self.processing_duration_seconds:.1f}s!\n", file=sys.stderr)
-        self._print_timing_summary()
 
     def _prepare_gpu_work_item(self, frame_batch: List[tuple[int, np.ndarray]], batch_id: int) -> Optional[GPUWorkItem]:
         if not frame_batch:
             return None
         # --- Detection ---
-        detect_start = time.time()
+        detect_start = time.perf_counter()
         frames_only = [frame for _, frame in frame_batch]
         batch_detections = self.processor.detect_faces_batch(
             frames_only,
@@ -307,21 +284,21 @@ class VideoFaceRecognition:
             imgsz=self.face_imgsz,
             augment=self.face_augment,
         )
-        detect_elapsed = time.time() - detect_start
+        detect_elapsed = time.perf_counter() - detect_start
         self.detect_timings.append(detect_elapsed)
 
         # --- Frame PIL Conversion (PreFrame Embedding) ---
-        frame_emb_start = time.time()
+        frame_pil_start = time.perf_counter()
         def convert_frame(frame_data):
             _, frame = frame_data
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             return Image.fromarray(frame_rgb)
         frame_pils = list(ThreadPoolExecutor(max_workers=min(len(frame_batch), 4)).map(convert_frame, frame_batch))
-        frame_emb_elapsed = time.time() - frame_emb_start
-        self.frame_emb_timings.append(frame_emb_elapsed)
+        frame_pil_elapsed = time.perf_counter() - frame_pil_start
+        self.frame_pil_timings.append(frame_pil_elapsed)
 
         # --- Cropping ---
-        crop_start = time.time()
+        crop_start = time.perf_counter()
         all_face_crops, all_face_coords, frame_face_indices = [], [], []
         crop_tasks = []
         for frame_idx, ((frame_num, frame), detections) in enumerate(zip(frame_batch, batch_detections)):
@@ -344,7 +321,7 @@ class VideoFaceRecognition:
                     all_face_crops.append(face_img)
                     all_face_coords.append(coords)
                     frame_face_indices[frame_idx].append(face_idx)
-        crop_elapsed = time.time() - crop_start
+        crop_elapsed = time.perf_counter() - crop_start
         self.crop_timings.append(crop_elapsed)
         return GPUWorkItem(
             batch_id=batch_id,
@@ -357,43 +334,43 @@ class VideoFaceRecognition:
         )
 
     def _process_gpu_work_item(self, work_item: GPUWorkItem) -> GPUResult:
-        batch_total_start = time.time()
+        batch_total_start = time.perf_counter()
         # Face embedding/match
-        face_emb_start = time.time()
+        face_emb_start = time.perf_counter()
         all_face_embs = None
         batch_matches: List[List[tuple[str, float]]] = []
         if work_item.face_crops and self.face_embeddings:
             all_face_embs = self.processor.generate_embeddings_batch(work_item.face_crops)
-            face_emb_elapsed = time.time() - face_emb_start
+            face_emb_elapsed = time.perf_counter() - face_emb_start
             self.face_emb_timings.append(face_emb_elapsed)
-            face_match_start = time.time()
+            face_match_start = time.perf_counter()
             batch_matches = find_all_matches_batch(
                 all_face_embs,
                 self.face_embeddings,
                 self.face_tolerance,
                 device=self.processor.device,
             )
-            face_match_elapsed = time.time() - face_match_start
+            face_match_elapsed = time.perf_counter() - face_match_start
             self.face_match_timings.append(face_match_elapsed)
         else:
             batch_matches = [[] for _ in work_item.face_crops]
             self.face_emb_timings.append(0.0)
             self.face_match_timings.append(0.0)
         # Frame embedding/match
-        frame_emb_start = time.time()
+        frame_emb_start = time.perf_counter()
         batch_frame_matches: List[List[tuple[str, float]]] = []
         if self.full_image_embeddings and work_item.frame_pils:
             batch_frame_embs = self.processor.generate_embeddings_batch(work_item.frame_pils)
-            frame_emb_elapsed = time.time() - frame_emb_start
+            frame_emb_elapsed = time.perf_counter() - frame_emb_start
             self.frame_emb_timings.append(frame_emb_elapsed)
-            frame_match_start = time.time()
+            frame_match_start = time.perf_counter()
             batch_frame_matches = find_all_matches_batch(
                 batch_frame_embs,
                 self.full_image_embeddings,
                 self.character_tolerance,
                 device=self.processor.device,
             )
-            frame_match_elapsed = time.time() - frame_match_start
+            frame_match_elapsed = time.perf_counter() - frame_match_start
             self.frame_match_timings.append(frame_match_elapsed)
         else:
             batch_frame_matches = [[] for _ in work_item.frame_pils]
@@ -401,7 +378,7 @@ class VideoFaceRecognition:
             self.frame_match_timings.append(0.0)
         # For organizing, just append 0 (not implemented)
         self.organize_timings.append(0.0)
-        batch_total_elapsed = time.time() - batch_total_start
+        batch_total_elapsed = time.perf_counter() - batch_total_start
         self.batch_total_timings.append(batch_total_elapsed)
         return GPUResult(
             batch_id=work_item.batch_id,
@@ -486,7 +463,6 @@ class VideoFaceRecognition:
         return FrameData(frame_number=0, faces=faces, characters=characters)
 
     def _print_timing_summary(self):
-        import numpy as np
         def stats(arr):
             arr = np.array(arr)
             if len(arr) == 0:
@@ -494,6 +470,7 @@ class VideoFaceRecognition:
             return f"avg {arr.mean():.3f}s, min {arr.min():.3f}s, max {arr.max():.3f}s, n={len(arr)}"
         print("\n--- Processing Timing Statistics ---")
         print(f"Detection:        {stats(self.detect_timings)}")
+        print(f"Frame PIL Conv:   {stats(self.frame_pil_timings)}")
         print(f"Frame Embedding:  {stats(self.frame_emb_timings)}")
         print(f"Frame Matching:   {stats(self.frame_match_timings)}")
         print(f"Cropping:         {stats(self.crop_timings)}")
@@ -504,7 +481,6 @@ class VideoFaceRecognition:
         print("------------------------------------\n")
 
     def get_results(self) -> VideoFaceRecognitionResult:
-        from ..models.video import VideoProcessingStatistics
         def stat_entry(arr):
             arr = np.array(arr)
             return {
@@ -542,10 +518,10 @@ class VideoFaceRecognition:
         )
 
     def save_results(self) -> Path:
-        SAMPLE_VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         filename = FACE_DETECTIONS_FILENAME_PATTERN.format(timestamp=timestamp)
-        self.output_path = SAMPLE_VIDEO_DIR / filename
+        self.output_path = self.output_dir / filename
         results = self.get_results()
         with open(self.output_path, "w") as f:
             f.write(results.model_dump_json(indent=2))

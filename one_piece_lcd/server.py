@@ -67,12 +67,16 @@ def video_page(video_id: str) -> str | tuple[str, int]:
 def video_file(video_id: str) -> Response:
     """Serve the video file."""
     video_dir = get_video_dir(video_id)
-    video_path = video_dir / f"{video_id}.mp4"
-    
-    if not video_path.exists():
+    mp4_path = video_dir / f"{video_id}.mp4"
+    mkv_path = video_dir / f"{video_id}.mkv"
+
+    if mp4_path.exists():
+        return send_file(mp4_path, mimetype="video/mp4")
+    elif mkv_path.exists():
+        # mkv file may not play in all browsers, but serve it anyway
+        return send_file(mkv_path, mimetype="video/x-matroska")
+    else:
         return Response("Video file not found", status=404)
-    
-    return send_file(video_path, mimetype="video/mp4")
 
 
 @app.route("/api/video/<video_id>/detections")

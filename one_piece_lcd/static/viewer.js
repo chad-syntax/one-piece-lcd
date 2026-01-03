@@ -10,7 +10,7 @@ const timelineMarker = document.getElementById('timeline-marker');
 let detections = null;
 let frameMap = {};
 let frameSkip = 5;
-let fps = VIDEO_FPS;
+let fps = VIDEO_FPS; // Fallback FPS, will be updated from video metadata
 let totalVideoFrames = 0;
 let lastDrawnFrame = -1; // Track last drawn frame to avoid redundant redraws
 
@@ -161,6 +161,11 @@ fetch(`/api/video/${VIDEO_ID}/detections`)
         
         // Build timeline after loading
         buildTimeline();
+        
+        // Update FPS if video is already loaded
+        if (video.readyState >= 1) {
+            updateFPS();
+        }
     })
     .catch(err => console.error('Failed to load detections:', err));
 
@@ -170,15 +175,29 @@ function resizeCanvas() {
     canvas.height = video.videoHeight;
 }
 
-video.addEventListener('loadedmetadata', resizeCanvas);
+// Calculate actual FPS from video element and JSON data
+function updateFPS() {
+    if (video.duration && detections && detections.total_frames) {
+        // Calculate FPS from video duration and total frames
+        fps = detections.total_frames / video.duration;
+        console.log(`Calculated video FPS: ${fps.toFixed(2)} (from ${detections.total_frames} frames / ${video.duration.toFixed(2)}s)`);
+    }
+}
+
+video.addEventListener('loadedmetadata', () => {
+    resizeCanvas();
+    updateFPS();
+});
+
 video.addEventListener('resize', resizeCanvas);
 
 // Draw bounding boxes (only redraws when frame changes)
 function drawBoxes(force = false) {
-    if (!detections) return;
+    if (!detections || !video.duration || !fps) return;
     
+    // Get current time from video element and calculate frame number
     const currentTime = video.currentTime;
-    const currentFrame = Math.floor(currentTime * fps / frameSkip) * frameSkip;
+    const currentFrame = Math.floor(currentTime * fps);
     
     // Skip redraw if same frame (unless forced, e.g., on seek)
     if (!force && currentFrame === lastDrawnFrame) return;

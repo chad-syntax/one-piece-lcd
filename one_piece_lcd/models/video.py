@@ -1,7 +1,10 @@
 """Pydantic models for video face recognition output."""
 
+from dataclasses import dataclass
 from typing import List, Dict, Optional
 from pydantic import BaseModel, Field
+import numpy as np
+from PIL import Image
 
 class Coordinates(BaseModel):
     """Bounding box coordinates for a detected face."""
@@ -103,3 +106,28 @@ class VideoFaceRecognitionResult(BaseModel):
         default=None,
         description="Pipeline timing statistics for the run"
     )
+
+
+# Internal data classes for GPU processing pipeline
+@dataclass
+class GPUWorkItem:
+    """Work item passed to GPU processing thread."""
+    batch_id: int
+    frame_batch: List[tuple[int, np.ndarray]]
+    face_crops: List[Image.Image]
+    face_coords: List[tuple[int, int, int, int]]
+    frame_face_indices: List[List[int]]
+    frame_pils: List[Image.Image]
+    detections: List[List[dict]]
+
+@dataclass
+class GPUResult:
+    """Result from GPU processing thread."""
+    batch_id: int
+    frame_batch: List[tuple[int, np.ndarray]]
+    detections: List[List[dict]]
+    frame_face_indices: List[List[int]]
+    all_face_coords: List[tuple[int, int, int, int]]
+    batch_matches: List[List[tuple[str, float]]]
+    batch_frame_matches: List[List[tuple[str, float]]]
+    all_face_embs: Optional[List[np.ndarray]]
